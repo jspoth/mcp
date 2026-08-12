@@ -24,15 +24,75 @@ import matplotlib.pyplot as plt
 
 SAMPLE_RATE = 22050
 
+# Bump by hand when a change could alter results for the same recording.
+ANALYSIS_VERSION = "1.0"
+
+MAX_FILE_SIZE_MB = 50
+MAX_DURATION_SEC = 600  # 10 minutes
+
+# Magic-byte signatures, checked against real file content — not the
+# extension — to catch e.g. an image renamed to "recording.wav".
+_AUDIO_VIDEO_SIGNATURES = {
+    "WAV":  lambda h: h[0:4] == b"RIFF" and h[8:12] == b"WAVE",
+    "AIFF": lambda h: h[0:4] == b"FORM" and h[8:12] in (b"AIFF", b"AIFC"),
+    "FLAC": lambda h: h[0:4] == b"fLaC",
+    "OGG":  lambda h: h[0:4] == b"OggS",
+    "MP3":  lambda h: h[0:3] == b"ID3" or (h[0:1] == b"\xff" and (h[1] & 0xE0) == 0xE0),
+    # MP4/M4A/MOV all use the ISO base media "ftyp" box at offset 4.
+    "MP4/M4A/MOV": lambda h: h[4:8] == b"ftyp",
+    "WebM/MKV": lambda h: h[0:4] == b"\x1a\x45\xdf\xa3",
+    "WMA/ASF": lambda h: h[0:16] == bytes.fromhex("3026b2758e66cf11a6d900aa0062ce6c"),
+}
+
+
+def validate_audio_file(filepath):
+    """
+    Confirm `filepath` is a real audio/video file by checking its magic
+    bytes, not its extension. Raises ValueError with a clear reason if not.
+    Deliberately doesn't try to fully parse the container — that's
+    librosa/ffmpeg's job next; this just rejects obviously-wrong files
+    (like a renamed image) before they reach that stage.
+    """
+    if not os.path.isfile(filepath):
+        raise ValueError(f"{filepath!r} is not a file.")
+    size_bytes = os.path.getsize(filepath)
+    if size_bytes == 0:
+        raise ValueError(f"{filepath!r} is empty.")
+    size_mb = size_bytes / (1024 * 1024)
+    if size_mb > MAX_FILE_SIZE_MB:
+        raise ValueError(
+            f"{filepath!r} is {size_mb:.1f} MB, over the {MAX_FILE_SIZE_MB} MB limit "
+            f"for a single practice recording."
+        )
+
+    with open(filepath, "rb") as f:
+        header = f.read(16)
+
+    for fmt, matches in _AUDIO_VIDEO_SIGNATURES.items():
+        if matches(header):
+            return fmt
+
+    raise ValueError(
+        f"{filepath!r} doesn't look like a supported audio/video file "
+        f"(no recognized WAV/MP3/FLAC/OGG/AIFF/MP4/WebM/WMA header found). "
+        f"If this is a real recording in a less common format, open an issue."
+    )
+
 
 def detect_onset_times(filepath, sr=SAMPLE_RATE, min_onset_gap_sec=0.05):
     """Detect stroke onset times (seconds) across the whole recording."""
+    validate_audio_file(filepath)
     y, sr = librosa.load(filepath, sr=sr)
 
-    # Onset detection needs a little audio context before a transient to
-    # register it, so a click sitting right at t=0 can be missed. Prepend a
-    # brief silence pad and subtract it back out of the returned times so
-    # callers still see times relative to the original, unpadded recording.
+    duration = len(y) / sr
+    if duration > MAX_DURATION_SEC:
+        raise ValueError(
+            f"{filepath!r} is {duration / 60:.1f} minutes long, over the "
+            f"{MAX_DURATION_SEC // 60}-minute limit for a single practice recording."
+        )
+
+    # Pad with silence so a stroke right at t=0 isn't missed, then subtract
+    # the pad back out of the returned times.
     pad_sec = 0.25
     pad_samples = int(pad_sec * sr)
     y_padded = np.concatenate([np.zeros(pad_samples, dtype=y.dtype), y])
@@ -40,22 +100,12 @@ def detect_onset_times(filepath, sr=SAMPLE_RATE, min_onset_gap_sec=0.05):
     onset_frames = librosa.onset.onset_detect(y=y_padded, sr=sr, backtrack=True, units="frames")
     onset_times = librosa.frames_to_time(onset_frames, sr=sr) - pad_sec
 
-    # backtrack finds the nearest preceding STRICT local minimum of onset
-    # strength, and the padded region is flat zero, so it always stops
-    # right at (or a few ms before) the pad boundary — it can't walk
-    # arbitrarily far into the padding chasing a minimum that doesn't
-    # exist there. Any resulting negative time is small quantization
-    # error, not a detection artifact, and represents a real stroke the
-    # padding was added specifically to catch — so clip it to 0 rather
-    # than drop it.
+    # backtrack can land a few ms into the silent pad; clip rather than drop,
+    # since it's still a real stroke near t=0.
     onset_times = np.clip(onset_times, 0, None)
 
-    # Clipping near-zero negative times to 0 can pile up two onsets that
-    # were genuinely a few ms apart onto the exact same instant. More
-    # generally, onsets closer together than any real stroke interval are
-    # almost always the same physical stroke crossing the onset threshold
-    # twice (attack + decay), not two strokes. Merge them by keeping the
-    # earlier one.
+    # Onsets closer together than a real stroke interval are almost always
+    # one stroke's attack+decay, not two — merge, keeping the earlier one.
     if len(onset_times) > 1:
         deduped = [onset_times[0]]
         for t in onset_times[1:]:
@@ -63,7 +113,6 @@ def detect_onset_times(filepath, sr=SAMPLE_RATE, min_onset_gap_sec=0.05):
                 deduped.append(t)
         onset_times = np.array(deduped)
 
-    duration = len(y) / sr
     return onset_times, duration
 
 
@@ -550,8 +599,12 @@ def main():
                               "flagged suspect (likely missed onset) instead of scored (default: 1.7)")
     args = parser.parse_args()
 
-    analyze_timing(args.filepath, bpm=args.bpm, plot=not args.no_plot, window=args.window,
-                    min_gap_fraction=args.min_gap_fraction, max_gap_fraction=args.max_gap_fraction)
+    try:
+        analyze_timing(args.filepath, bpm=args.bpm, plot=not args.no_plot, window=args.window,
+                        min_gap_fraction=args.min_gap_fraction, max_gap_fraction=args.max_gap_fraction)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -1,31 +1,17 @@
 """
-MCP server exposing timing_analysis.py as tools for an LLM client
-(Claude Desktop, Claude Code, etc.) — analyze the timing/tempo accuracy of a
-percussion practice recording directly from your chat client.
+MCP server exposing timing_analysis.py as tools for an LLM client — analyze
+the timing/tempo accuracy of a percussion practice recording from chat.
 
-This is a thin wrapper: all analysis logic lives in timing_analysis.py
-(detect_onset_times, estimate_bpm, compute_tempo_intervals, plot_timing).
-This file only adapts those functions to the MCP tool-calling protocol.
-
-Security / transparency design:
-  - The tool takes a filepath and reads the audio locally via the existing
-    functions (which use librosa). The raw audio bytes / waveform sample
-    array are NEVER included in the tool's return value — only computed
-    stats (and, optionally, a rendered chart image) go back to the LLM host.
-  - stdin/stdout are reserved for the MCP JSON-RPC protocol channel, so this
-    server never uses print()/input() on them. Since an MCP server can't do
-    an interactive y/n confirmation prompt the way a CLI script can,
-    transparency here comes from logging the exact payload being returned
-    to stderr before it's sent, plus most MCP hosts showing the tool
-    call/result inline in the chat.
+Thin wrapper: all analysis logic lives in timing_analysis.py. Never returns
+raw audio, only computed stats (and optionally a rendered chart). Payloads
+are logged to stderr before returning (stdout/stdin are the MCP channel).
 
 Install (inside a venv):
     python3 -m venv venv
     source venv/bin/activate
     pip install -r requirements.txt
 
-Run directly (for a quick sanity check — it will just sit waiting for
-stdio protocol input, which is expected):
+Run directly (sanity check — sits waiting for stdio input, expected):
     python mcp_server.py
 
 --------------------------------------------------------------------------
@@ -50,19 +36,20 @@ Or with Claude Code CLI:
 
 import json
 import sys
+import uuid
+from datetime import datetime, timezone
 
 import numpy as np
 
 from timing_analysis import (
+    ANALYSIS_VERSION,
     compute_tempo_intervals,
     detect_onset_times,
     estimate_bpm,
     plot_timing,
 )
 
-# This installed SDK version (mcp==2.0.0) renamed the old FastMCP class to
-# MCPServer, but it's the same ergonomic decorator-based API. Fall back to
-# FastMCP under its older name if that's what's installed instead.
+# mcp==2.0.0 renamed FastMCP to MCPServer; fall back to the old name if needed.
 try:
     from mcp.server.fastmcp import FastMCP as _MCPServerClass
 except ImportError:
@@ -76,18 +63,27 @@ except ImportError:
 mcp = _MCPServerClass("mridangam-playing-analysis")
 
 
+def _log(event, level="info", **fields):
+    """One-line JSON log to stderr — stdin/stdout are the MCP channel."""
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "level": level,
+        "event": event,
+        **fields,
+    }
+    print(json.dumps(entry, default=str), file=sys.stderr)
+
+
 def _build_analysis(filepath: str, bpm: float | None = None) -> dict:
     """
-    Core implementation, kept separate from the @mcp.tool wrapper so it can
-    be called directly (and verified) without going through the MCP
-    protocol layer.
-
-    Reuses the Phase-1 functions in timing_analysis.py directly rather than
-    reimplementing any onset/tempo logic. Returns ONLY a plain-data stats
-    dict — never the raw waveform, never audio bytes, never anything
-    derived straight from librosa.load()'s sample array.
+    Core implementation, separate from the @mcp.tool wrapper so it can be
+    called and tested directly. Returns a plain-data stats dict — never the
+    raw waveform or audio bytes.
     """
-    onset_times, duration = detect_onset_times(filepath)
+    try:
+        onset_times, duration = detect_onset_times(filepath)
+    except ValueError as exc:
+        return {"filepath": filepath, "error": str(exc)}
 
     if len(onset_times) == 0:
         return {
@@ -96,12 +92,20 @@ def _build_analysis(filepath: str, bpm: float | None = None) -> dict:
             "duration_sec": float(duration),
         }
 
+    MIN_ONSETS = 5
+    if len(onset_times) < MIN_ONSETS:
+        return {
+            "filepath": filepath,
+            "duration_sec": float(duration),
+            "onset_count": int(len(onset_times)),
+            "error": f"Only {len(onset_times)} onset(s) detected — too few to say "
+                     f"anything meaningful about timing. Try a longer recording.",
+        }
+
     target_bpm = float(bpm) if bpm is not None else estimate_bpm(filepath)
     bpm_was_estimated = bpm is None
-    # Mirrors the plausibility check in timing_analysis.analyze_timing (CLI):
-    # librosa's beat tracker is tuned for harmonic/percussive mixes and can
-    # misjudge solo percussion. Surface this in the payload so the LLM
-    # flags it instead of silently reporting stats built on a bad estimate.
+    # Mirrors the CLI's plausibility check — librosa's beat tracker can
+    # misjudge solo percussion tempo.
     bpm_warning = None
     if bpm_was_estimated and not (30 <= target_bpm <= 300):
         bpm_warning = (
@@ -130,21 +134,14 @@ def _build_analysis(filepath: str, bpm: float | None = None) -> dict:
             "error": "Only one onset detected — no gaps to analyze.",
         }
 
-    # Gaps flagged "suspect" (likely a duplicate or missed onset from
-    # detection, not a real mistimed stroke) are excluded from the tempo
-    # statistics — same rule timing_analysis.print_report applies. Without
-    # this, a single missed onset (e.g. a 2x gap read as -50% deviation)
-    # can dominate the average/std of an otherwise clean recording.
+    # Suspect gaps (likely duplicate/missed onsets, not real mistiming) are
+    # excluded from the stats — same rule as the CLI's print_report.
     reliable = [iv for iv in intervals if not iv["suspect"]]
     short_count = sum(1 for iv in intervals if iv.get("suspect_reason") == "short")
     long_count = sum(1 for iv in intervals if iv.get("suspect_reason") == "long")
-    # Every "instantaneous_bpm"/"deviation_pct" in `gaps` is measured against
-    # target_bpm * that gap's subdivision, not target_bpm directly (e.g. a
-    # gap under subdivision 2 is compared to 2x target_bpm as the expected
-    # stroke rate). Surface what subdivision(s) were actually used so a
-    # caller (an LLM paraphrasing this to the user) doesn't present a
-    # 160-bpm stroke rate as a deviation from an 80-bpm target without that
-    # context.
+    # Each gap's deviation is measured against target_bpm * its subdivision —
+    # surface what subdivisions were used so the LLM doesn't misread a
+    # subdivided stroke rate as a plain deviation from target_bpm.
     subdivisions_used = sorted(set(iv["subdivision"] for iv in intervals))
 
     if not reliable:
@@ -219,26 +216,26 @@ def analyze_timing(filepath: str, bpm: float | None = None, include_chart: bool 
             stats, not the raw audio) and attaches it to the response. Off
             by default, since it's the one path that touches disk.
     """
+    request_id = uuid.uuid4().hex[:8]
     summary = _build_analysis(filepath, bpm)
+    summary["analysis_version"] = ANALYSIS_VERSION
 
-    # Transparency mechanism per music.md: stdin/stdout are the MCP
-    # protocol channel, so an interactive confirmation prompt isn't
-    # possible here. Instead, log the exact payload being returned to
-    # stderr before returning it.
-    print(
-        f"[mcp_server] analyze_timing returning payload:\n"
-        f"{json.dumps(summary, indent=2)}",
-        file=sys.stderr,
+    # Logged before returning — stdin/stdout are the MCP channel, so this is
+    # the transparency mechanism instead of an interactive prompt.
+    _log(
+        "analyze_timing_result",
+        level="warning" if "error" in summary else "info",
+        request_id=request_id,
+        filepath=filepath,
+        include_chart=include_chart,
+        result=summary,
     )
 
     if not include_chart or ("error" in summary and "gaps" not in summary):
         return summary
 
-    # Chart is generated from the already-computed `intervals`/stats, not
-    # from raw audio. It's written to a temp file only because the MCP
-    # Image type needs a path to read from — the file is removed again
-    # immediately after Image() has read its bytes into memory, so nothing
-    # from this call persists on disk once the response is built.
+    # Written to a temp file only because Image() needs a path; removed
+    # again right after it reads the bytes in, so nothing persists on disk.
     import os
     import tempfile
 
@@ -247,10 +244,11 @@ def analyze_timing(filepath: str, bpm: float | None = None, include_chart: bool 
     try:
         plot_timing(summary["gaps"], summary["target_bpm"], out_path)
         image = Image(path=out_path)
-        print("[mcp_server] chart rendered and attached to response", file=sys.stderr)
+        _log("chart_rendered", request_id=request_id, filepath=filepath)
         return [summary, image]
     except Exception as exc:  # chart generation is a nice-to-have, not required
-        print(f"[mcp_server] chart generation skipped: {exc}", file=sys.stderr)
+        _log("chart_generation_skipped", level="warning", request_id=request_id,
+             filepath=filepath, error=str(exc))
         return summary
     finally:
         if os.path.exists(out_path):
