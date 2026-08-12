@@ -98,6 +98,17 @@ def _build_analysis(filepath: str, bpm: float | None = None) -> dict:
 
     target_bpm = float(bpm) if bpm is not None else estimate_bpm(filepath)
     bpm_was_estimated = bpm is None
+    # Mirrors the plausibility check in timing_analysis.analyze_timing (CLI):
+    # librosa's beat tracker is tuned for harmonic/percussive mixes and can
+    # misjudge solo percussion. Surface this in the payload so the LLM
+    # flags it instead of silently reporting stats built on a bad estimate.
+    bpm_warning = None
+    if bpm_was_estimated and not (30 <= target_bpm <= 300):
+        bpm_warning = (
+            f"Estimated tempo ({target_bpm:.1f} bpm) is outside a plausible "
+            f"range for this kind of playing — treat the results below with "
+            f"real suspicion and pass bpm explicitly instead."
+        )
 
     if target_bpm <= 0:
         return {
@@ -141,6 +152,7 @@ def _build_analysis(filepath: str, bpm: float | None = None) -> dict:
             "filepath": filepath,
             "target_bpm": round(target_bpm, 2),
             "bpm_was_estimated": bpm_was_estimated,
+            "bpm_warning": bpm_warning,
             "duration_sec": round(float(duration), 2),
             "onset_count": int(len(onset_times)),
             "total_gaps": len(intervals),
@@ -162,6 +174,7 @@ def _build_analysis(filepath: str, bpm: float | None = None) -> dict:
         "filepath": filepath,
         "target_bpm": round(target_bpm, 2),
         "bpm_was_estimated": bpm_was_estimated,
+        "bpm_warning": bpm_warning,
         "duration_sec": round(float(duration), 2),
         "onset_count": int(len(onset_times)),
         "total_gaps": len(intervals),
@@ -188,19 +201,23 @@ def _build_analysis(filepath: str, bpm: float | None = None) -> dict:
 
 
 @mcp.tool()
-def analyze_timing(filepath: str, bpm: float | None = None):
+def analyze_timing(filepath: str, bpm: float | None = None, include_chart: bool = False):
     """
     Analyze stroke timing accuracy in a mridangam (or any percussion)
     recording against a target tempo.
 
     Detects stroke onsets, estimates tempo if not given, and computes
     gap-by-gap deviation from the target tempo. Returns only the computed
-    statistics (never the raw audio) plus an optional chart image.
+    statistics (never the raw audio) — nothing is written to disk unless
+    include_chart is set.
 
     Args:
         filepath: Path to a local audio/video file to analyze.
         bpm: Target tempo in beats per minute. If omitted, it is
             auto-estimated from the recording.
+        include_chart: If True, also renders a chart PNG (from the computed
+            stats, not the raw audio) and attaches it to the response. Off
+            by default, since it's the one path that touches disk.
     """
     summary = _build_analysis(filepath, bpm)
 
@@ -214,26 +231,30 @@ def analyze_timing(filepath: str, bpm: float | None = None):
         file=sys.stderr,
     )
 
-    if "error" in summary and "gaps" not in summary:
+    if not include_chart or ("error" in summary and "gaps" not in summary):
         return summary
 
-    # Optional nice-to-have: also render and return the chart as an MCP
-    # image content block. Chart is generated from the already-computed
-    # `intervals`/stats, not from raw audio, and only its rendered PNG
-    # bytes (not the waveform) are attached to the response.
-    try:
-        import os
-        import tempfile
+    # Chart is generated from the already-computed `intervals`/stats, not
+    # from raw audio. It's written to a temp file only because the MCP
+    # Image type needs a path to read from — the file is removed again
+    # immediately after Image() has read its bytes into memory, so nothing
+    # from this call persists on disk once the response is built.
+    import os
+    import tempfile
 
-        song_name = os.path.splitext(os.path.basename(filepath))[0]
-        out_path = os.path.join(tempfile.gettempdir(), f"{song_name}_timing_mcp.png")
+    song_name = os.path.splitext(os.path.basename(filepath))[0]
+    out_path = os.path.join(tempfile.gettempdir(), f"{song_name}_timing_mcp.png")
+    try:
         plot_timing(summary["gaps"], summary["target_bpm"], out_path)
         image = Image(path=out_path)
-        print(f"[mcp_server] chart rendered to {out_path}", file=sys.stderr)
+        print("[mcp_server] chart rendered and attached to response", file=sys.stderr)
         return [summary, image]
     except Exception as exc:  # chart generation is a nice-to-have, not required
         print(f"[mcp_server] chart generation skipped: {exc}", file=sys.stderr)
         return summary
+    finally:
+        if os.path.exists(out_path):
+            os.remove(out_path)
 
 
 if __name__ == "__main__":
