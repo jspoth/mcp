@@ -1,5 +1,0 @@
-mcp
-numpy
-librosa
-matplotlib
-soundfile
