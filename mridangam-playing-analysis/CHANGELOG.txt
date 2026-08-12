@@ -1,0 +1,18 @@
+v1.0.0- 2026-08-12
+- Timing analysis engine: onset detection, gap-by-gap tempo deviation
+  against a target BPM, auto subdivision detection — CLI and MCP server.
+- File validation: rejects files whose actual bytes don't match a known
+  audio/video format (e.g. an image renamed to `.wav`), independent of
+  extension.
+- Resource limits: 50 MB file size cap, 10-minute duration cap.
+- `bpm_warning` when an auto-estimated tempo looks implausible for solo
+  percussion.
+- Minimum-onset guard: recordings with too few detected onsets return an
+  explicit low-confidence result instead of a misleadingly precise one.
+- `analysis_version` field on every MCP response, for traceability back to
+  the algorithm version that produced a given result.
+- `include_chart` opt-in on the MCP tool — no file is written to disk
+  unless a chart is explicitly requested, and the temp file is removed
+  immediately after use.
+- Structured JSON logging (stderr) with a per-request id.
+- Pinned dependency versions.
