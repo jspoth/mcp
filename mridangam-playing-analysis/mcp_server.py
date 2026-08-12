@@ -83,11 +83,12 @@ def _build_analysis(filepath: str, bpm: float | None = None) -> dict:
     try:
         onset_times, duration = detect_onset_times(filepath)
     except ValueError as exc:
-        return {"filepath": filepath, "error": str(exc)}
+        return {"filepath": filepath, "analysis_status": "invalid_audio", "error": str(exc)}
 
     if len(onset_times) == 0:
         return {
             "filepath": filepath,
+            "analysis_status": "insufficient_data",
             "error": "No onsets detected in this recording.",
             "duration_sec": float(duration),
         }
@@ -96,6 +97,7 @@ def _build_analysis(filepath: str, bpm: float | None = None) -> dict:
     if len(onset_times) < MIN_ONSETS:
         return {
             "filepath": filepath,
+            "analysis_status": "insufficient_data",
             "duration_sec": float(duration),
             "onset_count": int(len(onset_times)),
             "error": f"Only {len(onset_times)} onset(s) detected — too few to say "
@@ -117,6 +119,7 @@ def _build_analysis(filepath: str, bpm: float | None = None) -> dict:
     if target_bpm <= 0:
         return {
             "filepath": filepath,
+            "analysis_status": "invalid_input",
             "error": f"{'Auto-estimated' if bpm_was_estimated else 'Given'} tempo "
                      f"({target_bpm:.1f} bpm) isn't usable — pass a positive bpm explicitly.",
             "duration_sec": float(duration),
@@ -127,6 +130,7 @@ def _build_analysis(filepath: str, bpm: float | None = None) -> dict:
     if not intervals:
         return {
             "filepath": filepath,
+            "analysis_status": "insufficient_data",
             "target_bpm": target_bpm,
             "bpm_was_estimated": bpm_was_estimated,
             "duration_sec": float(duration),
@@ -147,6 +151,7 @@ def _build_analysis(filepath: str, bpm: float | None = None) -> dict:
     if not reliable:
         return {
             "filepath": filepath,
+            "analysis_status": "low_confidence",
             "target_bpm": round(target_bpm, 2),
             "bpm_was_estimated": bpm_was_estimated,
             "bpm_warning": bpm_warning,
@@ -169,6 +174,7 @@ def _build_analysis(filepath: str, bpm: float | None = None) -> dict:
 
     summary = {
         "filepath": filepath,
+        "analysis_status": "success",
         "target_bpm": round(target_bpm, 2),
         "bpm_was_estimated": bpm_was_estimated,
         "bpm_warning": bpm_warning,

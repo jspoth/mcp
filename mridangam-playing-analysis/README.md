@@ -11,8 +11,8 @@ processing (onset detection) and arithmetic.
 
 ## What it does
 
-1. Detects when strokes were actually played in a recording (onset
-   detection via [`librosa`](https://librosa.org)).
+1. Detects likely stroke onsets in a recording (onset detection via
+   [`librosa`](https://librosa.org)).
 2. For each pair of consecutive strokes, computes the actual instantaneous
    tempo (60 / gap-in-seconds) and compares it to your target tempo.
 3. Auto-detects subdivision (e.g. two strokes per beat, as in konnakol-style
