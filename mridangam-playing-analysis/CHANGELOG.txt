@@ -1,4 +1,4 @@
-v1.0.0- 2026-08-12
+v1.0.0 - 2026-08-12
 - Timing analysis engine: onset detection, gap-by-gap tempo deviation
   against a target BPM, auto subdivision detection — CLI and MCP server.
 - File validation: rejects files whose actual bytes don't match a known
