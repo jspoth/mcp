@@ -1,214 +1,505 @@
 """
-Phase 0 of the MCP v2 plan: cycle-boundary detection.
+Cycle and section detection for rhythmic subdivision sequences.
 
-Purely data-oriented -- detect_cycle() takes a subdivision sequence (a
-plain list/array of small positive integers, e.g. the output of
-timing_analysis.py's detect_subdivision_windowed()) and knows nothing
-about audio files, onset detection, MCP, or LLMs. Kept isolated on purpose:
-easy to unit-test with hand-built sequences, and easy to swap out the
-detection algorithm later without touching anything that calls it.
+Phase 0 goals:
+    1. Detect a repeating cycle within a section.
+    2. Detect multiple rhythmic sections in one recording.
+    3. Return confidence and human-readable reasons.
 
-Does NOT interpret the sequence into a human-readable pattern (e.g.
-"6 6 6 2 3 4 5") -- that's later work. This module answers exactly one
-question: does this sequence repeat, and if so, with what period and how
-confidently.
+This module operates only on a subdivision sequence. It does not know
+anything about audio, MCP, or LLMs.
 """
 
 import numpy as np
 
-# Minimum number of consistent repetitions before a candidate cycle length
-# is trusted at all -- 2 repetitions can't distinguish "this is the
-# pattern" from "this happened to repeat once by chance."
+
 MIN_CONSISTENT_REPETITIONS = 3
 
-# A repetition must match the per-position median within this many units
-# (subdivision values are small positive integers, so this is an absolute
-# tolerance, not a relative one -- a relative tolerance breaks down at
-# small integer values like 1 vs 2) to count as "consistent."
 _REPETITION_MATCH_TOLERANCE = 0.5
-
-# Candidate cycle lengths below this are rejected outright -- period-2
-# candidates are dominated by false positives on short/noisy low-
-# cardinality integer sequences (easy to match by chance when values only
-# range 1-6) and rarely correspond to a meaningful rhythmic phrase anyway.
 _MIN_CANDIDATE_LEN = 3
-_MAX_CANDIDATE_LEN_FRACTION = 0.4  # candidate cycle length capped at 40% of
-                                   # the sequence length, so at least ~2-3
-                                   # repetitions are structurally possible
-
-# A candidate's raw autocorrelation must clear this to even be considered
-# -- filters out lags where the "local max" is really just noise wobbling
-# around zero. Deliberately low: this is only a pre-filter to avoid
-# wasting time validating pure-noise lags, NOT the real rejection
-# mechanism -- that's the consistent-repetitions check below, which
-# validates directly against the segmented data rather than a correlation
-# heuristic. Calibrated against a real case: one repetition out of six
-# fully replaced by out-of-pattern values (a severe, ~40%-of-comparisons-
-# contaminated corruption) still leaves real periodicity signal at the
-# true period, just weak (~0.10) -- a higher threshold here would reject
-# that candidate before it ever reaches the consistency check that's
-# actually meant to judge it.
+_MAX_CANDIDATE_LEN_FRACTION = 0.4
 _MIN_PERIODICITY_STRENGTH = 0.05
 
+# Section scanning.
+_SECTION_SCAN_REPETITIONS = 3
+_SECTION_STEP = 1
+_MIN_SECTION_LENGTH = 12
+
+# Two adjacent windows are considered the same rhythmic section when their
+# detected cycle lengths agree.
+_MIN_STABLE_WINDOWS = 3
+
+
+# ---------------------------------------------------------------------------
+# Basic helpers
+# ---------------------------------------------------------------------------
 
 def _robust_clip(signal: np.ndarray, max_mad: float = 1.5) -> np.ndarray:
-    """Clip values to within `max_mad` median-absolute-deviations of the
-    median. Raw autocorrelation weights outlier MAGNITUDE quadratically
-    (it's a sum of products), so one repetition that's uniformly off (e.g.
-    a rushed passage briefly played with much higher subdivision values)
-    can dominate and even invert the correlation profile for lags that
-    every OTHER repetition agrees on -- confirmed live: an otherwise-clean
-    period-4 pattern with one repetition replaced by out-of-range values
-    made autocorrelation negative at the true period, hiding it entirely.
-    Clipping bounds that one block's leverage while still preserving that
-    it's different (just not unboundedly so)."""
+    """Limit the influence of extreme subdivision outliers."""
     median = np.median(signal)
     mad = np.median(np.abs(signal - median))
+
     if mad == 0:
         return signal
+
     bound = max_mad * mad
     return np.clip(signal, median - bound, median + bound)
 
 
 def _autocorrelation(signal: np.ndarray) -> np.ndarray:
-    """Normalized autocorrelation (lag 0 == 1.0) of a 1-D real signal,
-    mean-removed so a constant signal doesn't produce spurious peaks, and
-    outlier-clipped first (see _robust_clip) so one aberrant block can't
-    dominate the whole profile."""
+    """Return normalized, mean-removed autocorrelation."""
     signal = _robust_clip(signal)
+
     x = signal - signal.mean()
+
     if np.allclose(x, 0):
         return np.zeros(len(signal))
+
     full = np.correlate(x, x, mode="full")
     mid = len(full) // 2
     ac = full[mid:]
+
+    if ac[0] == 0:
+        return np.zeros(len(signal))
+
     return ac / ac[0]
 
 
 def _segment(values: np.ndarray, period: int) -> np.ndarray:
-    """Split `values` into complete chunks of length `period`, dropping any
-    trailing partial chunk. Returns shape (n_reps, period)."""
+    """Split values into complete repetitions of period."""
     n_reps = len(values) // period
+
+    if n_reps == 0:
+        return np.empty((0, period))
+
     return values[: n_reps * period].reshape(n_reps, period)
 
 
 def _repetition_consistency(segments: np.ndarray) -> tuple:
     """
-    Compare each repetition (row) against the per-position median across
-    all repetitions. A repetition "matches" if at least 70% of its
-    positions are within _REPETITION_MATCH_TOLERANCE (absolute) of that
-    position's median.
+    Compare repetitions against the per-position median.
 
-    Returns (n_consistent: int, consistency_score: float in [0, 1]).
-    consistency_score is the fraction of (repetition, position) pairs that
-    matched -- finer-grained than n_consistent alone, since it also
-    reflects HOW consistent the consistent-enough repetitions are.
+    Returns:
+        (number_of_consistent_repetitions, consistency_score)
     """
-    close = np.abs(segments - np.median(segments, axis=0)) <= _REPETITION_MATCH_TOLERANCE
+    if len(segments) == 0:
+        return 0, 0.0
+
+    median = np.median(segments, axis=0)
+
+    close = (
+        np.abs(segments - median)
+        <= _REPETITION_MATCH_TOLERANCE
+    )
+
     consistency_score = float(close.mean())
-    n_consistent = int((close.mean(axis=1) >= 0.7).sum())
+
+    n_consistent = int(
+        (close.mean(axis=1) >= 0.7).sum()
+    )
+
     return n_consistent, consistency_score
 
 
-def detect_cycle(subdivision_sequence, min_repetitions: int = MIN_CONSISTENT_REPETITIONS) -> dict:
+# ---------------------------------------------------------------------------
+# Cycle detection
+# ---------------------------------------------------------------------------
+
+def detect_cycle(
+    subdivision_sequence,
+    min_repetitions: int = MIN_CONSISTENT_REPETITIONS,
+) -> dict:
     """
-    Find a repeating cycle length in `subdivision_sequence`, without
-    trusting a single autocorrelation peak in isolation.
+    Detect a repeating cycle in one rhythmic section.
 
-    Algorithm (per the explicit refinement this builds on -- confidence
-    must reflect BOTH periodicity and repetition consistency, not just the
-    strongest autocorrelation peak):
-      1. Autocorrelation over the sequence gives CANDIDATE periods (local
-         maxima clearing a minimum strength), not an answer.
-      2. Each candidate period is validated by actually segmenting the
-         sequence at that period and checking the repetitions agree with
-         each other (_repetition_consistency) -- a candidate with a
-         locally-strong autocorrelation peak but inconsistent segments is
-         rejected here even though step 1 would have accepted it.
-      3. A candidate is rejected outright if it doesn't produce at least
-         `min_repetitions` consistent repetitions.
-      4. Among surviving candidates, pattern_confidence blends BOTH
-         signals via geometric mean, so one weak signal can't be masked by
-         the other being strong. Ties in confidence are broken toward the
-         SHORTER period -- the same "simplest explanation wins" rule
-         timing_analysis.py's own _best_subdivision() uses, since a
-         period-N sequence trivially also "repeats" at every multiple of N
-         (e.g. a true period of 4 also looks periodic at lag 8, 12, ...).
+    Returns:
 
-    Returns exactly:
-      {"cycle_length": int or None, "pattern_confidence": float in [0, 1],
-       "reason": str}
-    `reason` is always present, on every branch (success, no-pattern, or
-    input-too-short) -- explainability is required on every path.
+        {
+            "cycle_length": int | None,
+            "pattern_confidence": float,
+            "reason": str
+        }
     """
-    seq = np.asarray(subdivision_sequence, dtype=float)
 
-    if len(seq) < (_MIN_CANDIDATE_LEN * min_repetitions):
+    seq = np.asarray(
+        subdivision_sequence,
+        dtype=float,
+    )
+
+    if len(seq) < _MIN_CANDIDATE_LEN * min_repetitions:
         return {
             "cycle_length": None,
             "pattern_confidence": 0.0,
             "reason": (
-                f"Only {len(seq)} value(s) in the sequence -- too few to reliably "
-                f"find a repeating pattern (need at least "
-                f"{_MIN_CANDIDATE_LEN * min_repetitions})."
+                f"Only {len(seq)} values; too few to reliably "
+                f"detect a repeating cycle."
             ),
         }
 
-    max_period = max(_MIN_CANDIDATE_LEN, int(len(seq) * _MAX_CANDIDATE_LEN_FRACTION))
-    hi = min(max_period, len(seq) - 1)
+    max_period = max(
+        _MIN_CANDIDATE_LEN,
+        int(len(seq) * _MAX_CANDIDATE_LEN_FRACTION),
+    )
+
+    hi = min(
+        max_period,
+        len(seq) - 1,
+    )
+
     if hi < _MIN_CANDIDATE_LEN:
         return {
             "cycle_length": None,
             "pattern_confidence": 0.0,
-            "reason": "Sequence too short relative to the minimum repetition count to test any candidate cycle length.",
+            "reason": "Sequence too short for cycle detection.",
         }
 
     ac = _autocorrelation(seq)
 
     candidates = []
-    for lag in range(_MIN_CANDIDATE_LEN, hi + 1):
-        if ac[lag] < _MIN_PERIODICITY_STRENGTH:
+
+    for lag in range(
+        _MIN_CANDIDATE_LEN,
+        hi + 1,
+    ):
+        strength = float(ac[lag])
+
+        if strength < _MIN_PERIODICITY_STRENGTH:
             continue
+
+        left = ac[lag - 1] if lag > 0 else strength
+        right = ac[lag + 1] if lag < len(ac) - 1 else strength
+
         is_local_max = (
-            (lag == _MIN_CANDIDATE_LEN or ac[lag] >= ac[lag - 1])
-            and (lag == hi or ac[lag] >= ac[lag + 1])
+            strength >= left
+            and strength >= right
         )
+
         if is_local_max:
-            candidates.append((lag, float(ac[lag])))
-    # Evaluate shortest-period candidates first so a tie in confidence
-    # naturally keeps the shorter period without needing a second pass.
-    candidates.sort(key=lambda t: t[0])
+            candidates.append(
+                (lag, strength)
+            )
+
+    # Shorter periods are preferred when confidence is nearly tied.
+    candidates.sort(key=lambda x: x[0])
 
     best = None
+
     for period, periodicity_strength in candidates:
+
         segments = _segment(seq, period)
+
         if len(segments) < min_repetitions:
             continue
-        n_consistent, consistency_score = _repetition_consistency(segments)
+
+        (
+            n_consistent,
+            consistency_score,
+        ) = _repetition_consistency(segments)
+
         if n_consistent < min_repetitions:
             continue
-        confidence = round(float(np.sqrt(max(periodicity_strength, 0.0) * consistency_score)), 3)
-        if best is None or confidence > best[0]:
-            best = (confidence, period, len(segments), n_consistent, periodicity_strength, consistency_score)
+
+        confidence = float(
+            np.sqrt(
+                max(periodicity_strength, 0.0)
+                * consistency_score
+            )
+        )
+
+        candidate = {
+            "confidence": confidence,
+            "period": period,
+            "n_repetitions": len(segments),
+            "n_consistent": n_consistent,
+            "periodicity": periodicity_strength,
+            "consistency": consistency_score,
+        }
+
+        if best is None:
+            best = candidate
+            continue
+
+        if confidence > best["confidence"] + 0.02:
+            best = candidate
 
     if best is None:
         return {
             "cycle_length": None,
             "pattern_confidence": 0.0,
             "reason": (
-                f"No candidate cycle length produced at least {min_repetitions} "
-                f"mutually consistent repetitions -- this sequence doesn't show "
-                f"a clear repeating pattern (or it's too short/noisy to confirm one)."
+                f"No cycle produced at least "
+                f"{min_repetitions} consistent repetitions."
             ),
         }
 
-    confidence, period, n_reps, n_consistent, periodicity_strength, consistency_score = best
+    confidence = best["confidence"]
+    period = best["period"]
+
     return {
-        "cycle_length": period,
-        "pattern_confidence": confidence,
+        "cycle_length": int(period),
+        "pattern_confidence": round(
+            confidence,
+            3,
+        ),
         "reason": (
-            f"Cycle length {period} detected: {n_reps} repetitions, "
-            f"{n_consistent} of them consistent with each other "
-            f"(periodicity {periodicity_strength:.2f}, consistency {consistency_score:.2f})."
+            f"Cycle length {period} detected from "
+            f"{best['n_consistent']}/{best['n_repetitions']} "
+            f"consistent repetitions; "
+            f"periodicity={best['periodicity']:.2f}, "
+            f"consistency={best['consistency']:.2f}."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Section detection
+# ---------------------------------------------------------------------------
+
+def _candidate_cycle_at(
+    sequence: np.ndarray,
+    start: int,
+    cycle_length: int,
+) -> dict:
+    """
+    Test whether a cycle is stable starting at a particular position.
+
+    The window contains enough repetitions to make the decision meaningful.
+    """
+
+    end = start + (
+        cycle_length * _SECTION_SCAN_REPETITIONS
+    )
+
+    if end > len(sequence):
+        return {
+            "cycle_length": None,
+            "confidence": 0.0,
+        }
+
+    result = detect_cycle(
+        sequence[start:end],
+        min_repetitions=_SECTION_SCAN_REPETITIONS,
+    )
+
+    return {
+        "cycle_length": result["cycle_length"],
+        "confidence": result["pattern_confidence"],
+    }
+
+
+def _find_local_cycle(
+    sequence: np.ndarray,
+    start: int,
+) -> dict:
+    """
+    Detect the locally dominant cycle around start.
+
+    We use a short local window rather than analysing the entire recording.
+    """
+
+    remaining = len(sequence) - start
+
+    if remaining < (
+        _MIN_SECTION_LENGTH
+    ):
+        return {
+            "cycle_length": None,
+            "confidence": 0.0,
+        }
+
+    max_period = max(
+        _MIN_CANDIDATE_LEN,
+        min(
+            int(remaining / _SECTION_SCAN_REPETITIONS),
+            int(remaining * 0.4),
+        ),
+    )
+
+    window_end = min(
+        len(sequence),
+        start + max(
+            _MIN_SECTION_LENGTH,
+            max_period * _SECTION_SCAN_REPETITIONS,
+        ),
+    )
+
+    window = sequence[start:window_end]
+
+    result = detect_cycle(
+        window,
+        min_repetitions=_SECTION_SCAN_REPETITIONS,
+    )
+
+    return {
+        "cycle_length": result["cycle_length"],
+        "confidence": result["pattern_confidence"],
+    }
+
+
+def detect_sections(
+    subdivision_sequence,
+    min_section_length: int = 15,
+    min_improvement: float = 0.10,
+) -> list:
+    """
+    Recursively split a sequence when two independently detected cycles
+    explain the data substantially better than one cycle for the whole region.
+
+    Example:
+
+        [7-cycle] [5-cycle] [7-cycle]
+
+    becomes:
+
+        section 1 -> cycle 7
+        section 2 -> cycle 5
+        section 3 -> cycle 7
+    """
+
+    seq = np.asarray(subdivision_sequence, dtype=float)
+    n = len(seq)
+
+    if n == 0:
+        return []
+
+    def split_region(start: int, end: int) -> list:
+        length = end - start
+
+        # Too short to split reliably.
+        if length < min_section_length * 2:
+            return [{
+                "start": start,
+                "end": end,
+                "sequence": seq[start:end].tolist(),
+            }]
+
+        whole = detect_cycle(
+            seq[start:end],
+            min_repetitions=MIN_CONSISTENT_REPETITIONS,
+        )
+
+        whole_confidence = whole["pattern_confidence"]
+
+        best_split = None
+
+        # Try every possible boundary.
+        for boundary in range(
+            start + min_section_length,
+            end - min_section_length + 1,
+        ):
+            left = detect_cycle(
+                seq[start:boundary],
+                min_repetitions=MIN_CONSISTENT_REPETITIONS,
+            )
+
+            right = detect_cycle(
+                seq[boundary:end],
+                min_repetitions=MIN_CONSISTENT_REPETITIONS,
+            )
+
+            if (
+                left["cycle_length"] is None
+                or right["cycle_length"] is None
+            ):
+                continue
+
+            # Both sides should explain their regions better than
+            # the unsplit region.
+            split_score = (
+                left["pattern_confidence"]
+                + right["pattern_confidence"]
+            ) / 2.0
+
+            improvement = split_score - whole_confidence
+
+            if improvement < min_improvement:
+                continue
+
+            candidate = {
+                "boundary": boundary,
+                "score": split_score,
+                "improvement": improvement,
+            }
+
+            if (
+                best_split is None
+                or candidate["score"] > best_split["score"]
+            ):
+                best_split = candidate
+
+        # No useful split → this is one section.
+        if best_split is None:
+            return [{
+                "start": start,
+                "end": end,
+                "sequence": seq[start:end].tolist(),
+            }]
+
+        boundary = best_split["boundary"]
+
+        # Recursively split both sides.
+        left_sections = split_region(
+            start,
+            boundary,
+        )
+
+        right_sections = split_region(
+            boundary,
+            end,
+        )
+
+        return left_sections + right_sections
+
+    return split_region(0, n)
+
+
+# ---------------------------------------------------------------------------
+# Public combined API
+# ---------------------------------------------------------------------------
+
+def detect_cycles_by_section(
+    subdivision_sequence,
+    min_repetitions: int = MIN_CONSISTENT_REPETITIONS,
+) -> dict:
+    """
+    Detect rhythmic sections first, then independently detect a cycle
+    within each section.
+    """
+
+    seq = np.asarray(
+        subdivision_sequence,
+        dtype=float,
+    )
+
+    sections = detect_sections(seq)
+
+    results = []
+
+    for index, section in enumerate(sections):
+
+        cycle = detect_cycle(
+            section["sequence"],
+            min_repetitions=min_repetitions,
+        )
+
+        results.append(
+            {
+                "section": index,
+                "start": section["start"],
+                "end": section["end"],
+                "cycle_length": cycle["cycle_length"],
+                "pattern_confidence": cycle[
+                    "pattern_confidence"
+                ],
+                "reason": cycle["reason"],
+            }
+        )
+
+    return {
+        "sections": results,
+        "num_sections": len(results),
+        "reason": (
+            f"Analyzed {len(results)} rhythmic "
+            f"section(s) independently."
         ),
     }
