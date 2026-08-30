@@ -303,22 +303,10 @@ def detect_subdivision_windowed(onset_times, target_bpm, window=6, candidates=ra
         if not initialized:
             current = candidate_n
             initialized = True
-
-        elif candidate_n != current:
-            # If the current subdivision has no support in this window,
-            # allow a sufficiently better candidate to take over even if
-            # that candidate is below min_confidence.
-            if (
-                current_score == 0.0
-                and candidate_score > 0.0
-            ):
-                current = candidate_n
-
-            elif (
-                candidate_score >= min_confidence
-                and candidate_score >= current_score + hysteresis_margin
-            ):
-                current = candidate_n
+        elif (candidate_n != current
+                and candidate_score >= min_confidence
+                and candidate_score >= current_score + hysteresis_margin):
+            current = candidate_n
 
         subdivisions.append(current)
 
@@ -595,19 +583,6 @@ def analyze_timing(filepath, bpm=None, plot=True, window=6, min_gap_fraction=0.4
 
     return intervals
 
-def get_onset_intervals(onset_times):
-    intervals = np.diff(onset_times)
-
-    if len(intervals) == 0:
-        return []
-
-    # Normalize timing so tempo doesn't matter.
-    median = np.median(intervals)
-
-    if median <= 0:
-        return []
-
-    return (intervals / median).tolist()
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze stroke timing accuracy against a target tempo.")

@@ -48,7 +48,7 @@ from timing_analysis import (
     estimate_bpm,
     plot_timing,
 )
-from mridangam_analysis import analyze_mridangam as _analyze_mridangam
+from progress_store import record_progress, get_progress_history
 
 # mcp==2.0.0 renamed FastMCP to MCPServer; fall back to the old name if needed.
 try:
@@ -238,6 +238,21 @@ def analyze_timing(filepath: str, bpm: float | None = None, include_chart: bool 
         result=summary,
     )
 
+    try:
+        progress_record = record_progress(filepath, summary)
+        if progress_record["duplicate_of"] is not None:
+            summary["duplicate_warning"] = (
+                f"This exact recording was already analyzed on "
+                f"{progress_record['duplicate_of']} -- this is a re-upload of the "
+                f"same audio, not a new practice session."
+            )
+    except OSError as exc:
+        # e.g. summary is an invalid_audio/insufficient_data result and the
+        # file itself couldn't be read -- don't let progress tracking fail
+        # the whole tool call over that.
+        _log("progress_record_skipped", level="warning", request_id=request_id,
+             filepath=filepath, error=str(exc))
+
     if not include_chart or ("error" in summary and "gaps" not in summary):
         return summary
 
@@ -263,31 +278,20 @@ def analyze_timing(filepath: str, bpm: float | None = None, include_chart: bool 
 
 
 @mcp.tool()
-def analyze_mridangam(filepath: str, script: str | None = None, bpm: float | None = None):
+def get_progress(filename: str | None = None):
     """
-    Unified analysis: validates playing against a script if one is given
-    (or found alongside the audio, same basename with a .txt/.script
-    extension), or infers the repeating pattern directly from the audio
-    and reports performance against that self-derived baseline if not.
-
-    Never asks a follow-up question -- always resolves to an answer, with
-    a `reason` field explaining which path was taken (script provided,
-    script found alongside the audio, or self-inferred) and a confidence
-    level for the inferred-pattern case. Stroke type identification is out
-    of scope; this only reasons about rhythmic timing/pattern.
+    Return this player's recorded analyze_timing() history, oldest first --
+    one entry per past analysis run, each with its timestamp and tempo/
+    consistency results, so a session-to-session trend (e.g. is
+    consistency_std_dev_pct improving on this piece) can be read off
+    directly.
 
     Args:
-        filepath: Path to a local audio/video file to analyze.
-        script: Optional whitespace-separated subdivision sequence (e.g.
-            "6 6 6 2 3 4 5") to validate the recording against directly.
-            If omitted, a co-located script file is checked for first,
-            then the pattern is inferred from the recording itself.
-        bpm: Target tempo. Auto-estimated if omitted.
+        filename: Restrict to sessions analyzing this file (matched by
+            basename, so the full original path isn't required). Omit to
+            get every recorded session across all files.
     """
-    request_id = uuid.uuid4().hex[:8]
-    result = _analyze_mridangam(filepath, script=script, bpm=bpm)
-    _log("analyze_mridangam_result", request_id=request_id, filepath=filepath, result=result)
-    return result
+    return get_progress_history(filename=filename)
 
 
 if __name__ == "__main__":
