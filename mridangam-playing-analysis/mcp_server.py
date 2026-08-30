@@ -48,6 +48,7 @@ from timing_analysis import (
     estimate_bpm,
     plot_timing,
 )
+from progress_store import record_progress, find_duplicate, get_progress_history
 
 # mcp==2.0.0 renamed FastMCP to MCPServer; fall back to the old name if needed.
 try:
@@ -204,7 +205,8 @@ def _build_analysis(filepath: str, bpm: float | None = None) -> dict:
 
 
 @mcp.tool()
-def analyze_timing(filepath: str, bpm: float | None = None, include_chart: bool = False):
+def analyze_timing(filepath: str, bpm: float | None = None, include_chart: bool = False,
+                    force: bool = False):
     """
     Analyze stroke timing accuracy in a mridangam (or any percussion)
     recording against a target tempo.
@@ -221,8 +223,34 @@ def analyze_timing(filepath: str, bpm: float | None = None, include_chart: bool 
         include_chart: If True, also renders a chart PNG (from the computed
             stats, not the raw audio) and attaches it to the response. Off
             by default, since it's the one path that touches disk.
+        force: If True, re-run the analysis even if this exact recording
+            (by content, not filename) was already analyzed before. Off by
+            default — a re-upload of the same audio returns the earlier
+            session's timestamp immediately instead of repeating the
+            (comparatively expensive) onset-detection/analysis work.
     """
     request_id = uuid.uuid4().hex[:8]
+
+    if not force:
+        try:
+            duplicate = find_duplicate(filepath)
+        except OSError:
+            duplicate = None  # let _build_analysis below produce the real error
+        if duplicate is not None:
+            _log("analyze_timing_duplicate_skipped", request_id=request_id,
+                 filepath=filepath, duplicate_of=duplicate["timestamp"])
+            return {
+                "analysis_status": "duplicate_skipped",
+                "duplicate_of": duplicate["timestamp"],
+                "previous_result": duplicate,
+                "reason": (
+                    f"This exact recording was already analyzed on "
+                    f"{duplicate['timestamp']} — skipped re-running the analysis "
+                    f"since the audio content is identical. Pass force=True to "
+                    f"re-analyze anyway."
+                ),
+            }
+
     summary = _build_analysis(filepath, bpm)
     summary["analysis_version"] = ANALYSIS_VERSION
 
@@ -236,6 +264,22 @@ def analyze_timing(filepath: str, bpm: float | None = None, include_chart: bool 
         include_chart=include_chart,
         result=summary,
     )
+
+    try:
+        progress_record = record_progress(filepath, summary)
+        if progress_record["duplicate_of"] is not None:
+            summary["duplicate_warning"] = (
+                f"This exact recording was already analyzed on "
+                f"{progress_record['duplicate_of']} -- this is a re-upload of the "
+                f"same audio, not a new practice session (force=True was used, so "
+                f"the analysis was re-run anyway)."
+            )
+    except OSError as exc:
+        # e.g. summary is an invalid_audio/insufficient_data result and the
+        # file itself couldn't be read -- don't let progress tracking fail
+        # the whole tool call over that.
+        _log("progress_record_skipped", level="warning", request_id=request_id,
+             filepath=filepath, error=str(exc))
 
     if not include_chart or ("error" in summary and "gaps" not in summary):
         return summary
@@ -259,6 +303,23 @@ def analyze_timing(filepath: str, bpm: float | None = None, include_chart: bool 
     finally:
         if os.path.exists(out_path):
             os.remove(out_path)
+
+
+@mcp.tool()
+def get_progress(filename: str | None = None):
+    """
+    Return this player's recorded analyze_timing() history, oldest first --
+    one entry per past analysis run, each with its timestamp and tempo/
+    consistency results, so a session-to-session trend (e.g. is
+    consistency_std_dev_pct improving on this piece) can be read off
+    directly.
+
+    Args:
+        filename: Restrict to sessions analyzing this file (matched by
+            basename, so the full original path isn't required). Omit to
+            get every recorded session across all files.
+    """
+    return get_progress_history(filename=filename)
 
 
 if __name__ == "__main__":
