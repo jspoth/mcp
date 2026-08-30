@@ -40,6 +40,22 @@ def _read_all(log_path):
     return records
 
 
+def find_duplicate(filepath, log_path=DEFAULT_LOG_PATH):
+    """
+    Return the earliest previous record with this exact file content (by
+    hash, not filename), or None if this content hasn't been seen before.
+
+    Deliberately cheap (a hash + a log scan, no audio analysis) so callers
+    can check BEFORE running the expensive analysis pipeline, not just flag
+    it after redoing all that work for a file already analyzed.
+    """
+    file_hash = _file_hash(filepath)
+    return next(
+        (r for r in _read_all(log_path) if r.get("file_hash") == file_hash),
+        None,
+    )
+
+
 def record_progress(filepath, result, log_path=DEFAULT_LOG_PATH):
     """
     Append one record for this analysis run. `result` is analyze_timing()'s
@@ -49,8 +65,9 @@ def record_progress(filepath, result, log_path=DEFAULT_LOG_PATH):
 
     If this exact file's content (by hash, not filename) already appears
     earlier in the log, `duplicate_of` is set to that earlier record's
-    timestamp -- callers should surface this rather than silently counting
-    a re-upload of the same recording as a new practice session.
+    timestamp. Most callers should have already checked find_duplicate()
+    and skipped the analysis entirely before reaching this point; this
+    still records the fact for a `force`d re-run.
     """
     file_hash = _file_hash(filepath)
     previous = next(

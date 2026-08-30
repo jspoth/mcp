@@ -1,3 +1,17 @@
+v1.1.0 - 2026-08-29
+- Progress tracking: every `analyze_timing` call is recorded (timestamp,
+  filename, tempo/consistency stats) to a local session log, queryable via
+  the new `get_progress` MCP tool to see trends across practice sessions
+  for a given recording.
+- Duplicate-upload detection: recordings are identified by content hash
+  (SHA-256), not filename, so re-uploading the same audio — even under a
+  different filename — is recognized as a re-upload rather than a new
+  practice session.
+- Duplicate check now runs BEFORE the analysis pipeline: a re-uploaded
+  recording returns the earlier session's result immediately instead of
+  re-running onset detection/tempo analysis. `force=True` on
+  `analyze_timing` re-runs the analysis anyway.
+
 v1.0.0 - 2026-08-12
 - Timing analysis engine: onset detection, gap-by-gap tempo deviation
   against a target BPM, auto subdivision detection — CLI and MCP server.

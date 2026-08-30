@@ -4,3 +4,4 @@ venv/
 *.png
 *.wav
 *.m4a
+progress_log.jsonl

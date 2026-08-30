@@ -9,7 +9,7 @@ reused filename with different content as NOT a duplicate) so tests write
 real temp files rather than passing fake paths.
 """
 
-from progress_store import record_progress, get_progress_history
+from progress_store import record_progress, find_duplicate, get_progress_history
 
 
 def _audio_file(tmp_path, name, content=b"fake-audio-bytes"):
@@ -107,3 +107,37 @@ def test_same_filename_different_content_is_not_duplicate(tmp_path):
 
     second = record_progress(take1, {"analysis_status": "success"}, log_path=str(log_path))
     assert second["duplicate_of"] is None
+
+
+# ---------------------------------------------------------------------------
+# find_duplicate(): the cheap pre-check callers should use BEFORE running
+# the expensive analysis, not just record_progress() flagging it after.
+# ---------------------------------------------------------------------------
+
+def test_find_duplicate_returns_none_for_unseen_content(tmp_path):
+    log_path = tmp_path / "progress_log.jsonl"
+    audio = _audio_file(tmp_path, "new.m4a", b"never-seen-before")
+    assert find_duplicate(audio, log_path=str(log_path)) is None
+
+
+def test_find_duplicate_finds_earlier_record_by_renamed_file(tmp_path):
+    log_path = tmp_path / "progress_log.jsonl"
+    original = _audio_file(tmp_path, "attempt1.m4a", b"same-recording-bytes")
+    record_progress(original, {"analysis_status": "success"}, log_path=str(log_path))
+
+    renamed = _audio_file(tmp_path, "attempt2.m4a", b"same-recording-bytes")
+    duplicate = find_duplicate(renamed, log_path=str(log_path))
+
+    assert duplicate is not None
+    assert duplicate["filename"] == "attempt1.m4a"
+
+
+def test_find_duplicate_does_not_append_to_log(tmp_path):
+    log_path = tmp_path / "progress_log.jsonl"
+    audio = _audio_file(tmp_path, "check_only.m4a", b"some-bytes")
+
+    find_duplicate(audio, log_path=str(log_path))
+
+    # find_duplicate() is a read-only check -- it must not create the log
+    # file or add an entry just from being called.
+    assert get_progress_history(log_path=str(log_path)) == []
